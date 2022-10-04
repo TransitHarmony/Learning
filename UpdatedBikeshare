@@ -1,0 +1,643 @@
+# Assignment 4 - Spatial Analysis in R
+
+# Census Data
+
+## Set up Workspace
+
+library(tidyverse)
+library(here)
+library(censusapi)
+library(tidycensus)
+library(plotly)
+library(tigris)
+library(sf)
+library(mapview)
+library(units)
+library(areal)
+library(glue)
+library(lehdr)
+
+readRenviron("~/.Renviron")
+
+## Search for variables
+### censusreporter.org also helps
+
+v17 <- load_variables(2019,"acs5", cache = TRUE)
+View(v17)
+here()
+
+## ACS 2015-2019 Census Data by Block Group ----
+
+CensusData <- get_acs(
+  geography = "block group",
+  variables = c(TotalPopulation = "B01003_001",
+                BlackPop = "B02001_003",
+                PovertyRatioTotal = "C17002_001",
+                PovertyOver150Pct = "C17002_006",
+                PovertyOver185Pct = "C17002_007",
+                PovertyOver200Pct = "C17002_008",
+                ZeroCarRent = "B25044_010",
+                ZeroCarOwn = "B25044_003",
+                Households = "B25044_001"),
+  year = 2019,
+  state = "DC",
+  geometry = TRUE,
+  output = "wide"
+)
+
+### Create csv for raw Census data
+RawCensusData <- st_set_geometry(CensusData, NULL)
+
+write.csv(RawCensusData, here("Data_Output", "RawCensusData.csv"), row.names=FALSE)
+
+
+CensusData$PctBlack <- CensusData$BlackPopE/CensusData$TotalPopulationE*100 ### Calculate pecentage of Black people
+CensusData$ZeroCarTotal <- (CensusData$ZeroCarRentE + CensusData$ZeroCarOwnE)/CensusData$HouseholdsE*100 ### Calculate percentage of 0 car HH
+CensusData$Under150PctPoverty <- (CensusData$PovertyRatioTotalE - CensusData$PovertyOver200PctE - CensusData$PovertyOver185PctE - CensusData$PovertyOver150PctE)/CensusData$PovertyRatioTotalE*100 ### Calculate percentage of people below 200% of poverty level
+
+CensusData <- CensusData %>%  ### Calculate area of each polygom
+  mutate(area = st_area(.))
+
+CensusData$area <- set_units(CensusData$area, mi^2) ### Change units from metres squared to miles squared
+
+CensusData$PopDensity <- CensusData$TotalPopulationE/CensusData$area ### Calculate population density
+
+head(CensusData)
+
+mapview(CensusData,
+        zcol = "ZeroCarTotal")
+
+
+
+## Keep variables of interest
+CensusData <- CensusData %>%
+  select(GEOID, 
+         PctBlack, 
+         ZeroCarTotal,
+         PopDensity,
+         area,
+         Under150PctPoverty) %>%
+  st_transform(4326)
+
+mapview(CensusData,
+        zcol = "area")
+
+
+
+
+## Find number of jobs per census block group ----
+Jobs <- st_read(here("Data", "DRAFT_COG_Cooperative_Forecast_9.2.shp"))
+
+mapview(Jobs,
+        zcol = "EMP2020")
+
+Jobs2020 <- Jobs %>%
+  select(EMP2020) %>%
+  st_transform(4326)
+
+### Estimate jobs by BG
+DC_Jobs <- st_interpolate_aw(
+  Jobs2020, 
+  CensusData,
+  extensive = TRUE
+)
+
+### Check it worked
+mapview(DC_Jobs,
+        zcol = "EMP2020")
+
+### No GEOID so find polygon centroid
+DC_Jobs$centroid <- st_centroid(DC_Jobs$geometry)
+
+DC_Jobs_centroid <- DC_Jobs %>%
+  select(EMP2020, 
+         centroid) %>%
+  st_transform(4326)
+
+mapview(DC_Jobs,
+        zcol = "EMP2020")
+
+
+### Remove geometry 
+DC_Jobs_centroid_nogeom <- st_drop_geometry(DC_Jobs_centroid)
+
+### Make into spatial data
+Jobs_Spatial <- st_as_sf(DC_Jobs_centroid_nogeom)
+
+### Join to CensusData
+CensusData <- st_join(CensusData, Jobs_Spatial)
+
+### Calculate job density
+CensusData$JobDensity <- CensusData$EMP2020/CensusData$area 
+
+mapview(CensusData,
+        zcol = "JobDensity")
+
+
+### Create csv for Census data
+st_write(CensusData, here("Data_Output", "CensusData.shp"), row.names=FALSE)
+
+
+rm(list = ls())
+
+CensusData <- st_read(here("Data_Output", "CensusData.shp"))
+
+
+
+
+
+# Bikeshare Trips ------
+
+# Import bikeshare trip data  
+BikeshareTrips201904 <- read_csv(here("Data", "201904-capitalbikeshare-tripdata.csv"))
+BikeshareTrips201906 <- read_csv(here("Data", "201906-capitalbikeshare-tripdata.csv"))
+BikeshareTrips201908 <- read_csv(here("Data", "201908-capitalbikeshare-tripdata.csv"))
+BikeshareTrips201910 <- read_csv(here("Data", "201910-capitalbikeshare-tripdata.csv"))
+BikeshareTrips201912 <- read_csv(here("Data", "201912-capitalbikeshare-tripdata.csv"))
+BikeshareTrips202002 <- read_csv(here("Data", "202002-capitalbikeshare-tripdata.csv"))
+BikeshareTrips202202 <- read_csv(here("Data", "202202-capitalbikeshare-tripdata.csv"))
+BikeshareTrips202204 <- read_csv(here("Data", "202204-capitalbikeshare-tripdata.csv"))
+
+# Make points and filter for DC
+BikeshareTrips201904 <- BikeshareTrips201904 %>%
+  st_as_sf(coords = c("Longitude", "Latitutde"),
+           crs = 4326) %>%
+  st_filter(CensusData, 
+            .predicate = st_is_within_distance,
+            dist = 0.1)
+
+rlang::last_error()
+
+BG_Trips201904 <- st_intersection(x = CensusData, y = BikeshareTrips201904)
+BG_Trips201904_Count <- BG_Trips201904 %>%
+  group_by(GEOID) %>%
+  count()
+
+
+
+BikeshareTrips201906 <- BikeshareTrips201906 %>%
+  st_as_sf(coords = c("Longitude", "Latitutde"),
+           crs = 4326) %>%
+  st_filter(CensusData, 
+            .predicate = st_is_within_distance,
+            dist = 0.1)
+
+BikeshareTrips201908 <- BikeshareTrips201908 %>%
+  st_as_sf(coords = c("Longitude", "Latitutde"),
+           crs = 4326) %>%
+  st_filter(CensusData, 
+            .predicate = st_is_within_distance,
+            dist = 0.1)
+
+BikeshareTrips201910 <- BikeshareTrips201910 %>%
+  st_as_sf(coords = c("Longitude", "Latitutde"),
+           crs = 4326) %>%
+  st_filter(CensusData, 
+            .predicate = st_is_within_distance,
+            dist = 0.1)
+
+BikeshareTrips201912 <- BikeshareTrips201912 %>%
+  st_as_sf(coords = c("Longitude", "Latitutde"),
+           crs = 4326) %>%
+  st_filter(CensusData, 
+            .predicate = st_is_within_distance,
+            dist = 0.1)
+
+BikeshareTrips202002 <- BikeshareTrips202002 %>%
+  st_as_sf(coords = c("Longitude", "Latitude"),
+           crs = 4326) %>%
+  st_filter(CensusData, 
+            .predicate = st_is_within_distance,
+            dist = 0.1)
+
+BikeshareTrips202202 <- BikeshareTrips202202 %>%
+  st_as_sf(coords = c("Longitude", "Latitutde"),
+           crs = 4326) %>%
+  st_filter(CensusData, 
+            .predicate = st_is_within_distance,
+            dist = 0.1)
+
+BikeshareTrips202204 <- BikeshareTrips202204 %>%
+  st_as_sf(coords = c("Longitude", "Latitutde"),
+           crs = 4326) %>%
+  st_filter(CensusData, 
+            .predicate = st_is_within_distance,
+            dist = 0.1)
+
+
+
+# Bikeshare Stations -----
+rm(list = ls())
+
+# Reload Census data
+CensusData <- st_read(here("Data_Output", "CensusData.shp"))
+CensusData <- read_csv(here("Data_Output", "CensusData.csv")) 
+
+# Import bikeshare station locations
+BikeshareStations <- read_csv(here("Data", "Bikeshare_Station_Locations.csv")) #### Can add as many folders needed to find file
+
+## create a dataset of geometry type POINT
+BikeshareLocations <- BikeshareStations %>%
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"),
+           crs = 4326) 
+
+### filter for stations accessible to Washington, DC
+BikeshareLocations <- BikeshareLocations %>%
+  st_filter(CensusData, 
+            .predicate = st_is_within_distance,
+            dist = 400)
+
+### Check bikeshare upload and Census data
+mapview(
+  CensusData,
+  zcol = "PpDnsty", ## Variable to display with color
+  layer.name = "Average Population Density"
+) + 
+  mapview(
+    BikeshareLocations,
+    col.regions = "red",
+    legend = FALSE
+  )
+
+## Create buffer
+BikeshareBuffer <- st_buffer(BikeshareLocations, dist = 400)
+
+mapview(
+  CensusData,
+  zcol = "PpDnsty", ## Variable to display with color
+  layer.name = "Average Population Density"
+) + 
+  mapview(
+    BikeshareBuffer,
+    col.regions = "red",
+    legend = FALSE
+  )
+  
+### Calculate area in buffers -----
+
+BikeshareBuffer <- BikeshareBuffer %>%  ### Calculate area of each polygon
+  mutate(area = st_area(.))
+
+BikeshareBuffer$BS_area <- set_units(BikeshareBuffer$area, mi^2) ### Change units from metres squared to miles squared
+
+BikeshareBuffer$BSIcalc <- BikeshareBuffer$CAPACITY*BikeshareBuffer$BS_area
+
+
+#### Keep variables of interest
+BikeshareBuffer <- BikeshareBuffer %>%
+  select(BS_area, 
+         BSIcalc) %>%
+  st_transform(4326)
+
+
+## Areal Weighting
+### Check coordinate reference systems
+st_crs(CensusData) 
+st_crs(BikeshareBuffer) 
+
+### Areal Weighting Interpolation -----
+BikeshareBG <- st_interpolate_aw(
+  BikeshareBuffer, 
+  CensusData,
+  extensive = TRUE
+)
+
+### Map interpolation data to check it worked
+mapview(
+  BikeshareBG,
+  zcol = "BSIcalc", ## Variable to display with color
+  layer.name = "BSI Calculation")
+
+## Join polygons
+### Join bikeshare calculations to census polygons
+CensusBikeshare <- st_join(
+  CensusData,
+  BikeshareBG,
+  join = st_within,
+  suffix = c("_Census", "_Bike") ### suffix defines the suffixes to be used for columns that share the same names
+) 
+
+
+### Calculate BSI
+CensusBikeshare$BSI_NoDock <- CensusBikeshare$BS_area/CensusBikeshare$area
+CensusBikeshare$BSI_Dock <- CensusBikeshare$BSIcalc/CensusBikeshare$area
+CensusBikeshare$BSI_perCapita <- CensusBikeshare$BSI_Dock/(CensusBikeshare$area*CensusBikeshare$PpDnsty/1000)
+
+### Replace NA with zero
+CensusBikeshare[is.na(CensusBikeshare)] <- 0 #### Replace NAs with 0
+
+## Map BSI over Washington, DC
+mapview(
+  CensusBikeshare,
+  zcol = "BSI_Dock", ## Variable to display with color
+  layer.name = "BSI_Dock")
+
+## Create production map
+library(tmap)
+BSI_Map <- tm_shape(CensusBikeshare,
+         unit = "mi") + 
+  tmap_style("watercolor") +
+  tm_polygons(title = "BSI",
+              col = "BSI_Dock",
+              breaks = c(0, 5, 20, 40, 60, 80, 170),
+              labels = c("<5", "5-20", "20-40", "40-60", "60-80", "80+")
+              ) +
+  tm_compass(type = "arrow") +
+  tm_scale_bar(text.size = 0.5)
+
+BSI_perCapMap <- tm_shape(CensusBikeshare,
+         unit = "mi") + 
+  tmap_style("watercolor") +
+  tm_polygons(title = "BSI per 1000 population",
+              col = "BSI_perCapita",
+              breaks = c(0, 5, 20, 40, 60, 80, 450),
+              labels = c("<5", "5-20", "20-40", "40-60", "60-80", "80+")
+  ) +
+    tm_compass(type = "arrow") +
+  tm_scale_bar(text.size = 0.5)
+
+tmap_arrange(BSI_Map, BSI_perCapMap)
+
+
+summary(CensusBikeshare)
+
+
+
+
+
+
+### Save  Census bikeshare data
+st_write(CensusBikeshare, here("Data_Output", "CensusBikeshare.shp"), row.names=FALSE)
+
+
+rm(list = ls())
+
+CensusBikeshare <- st_read(here("Data_Output", "CensusBikeshare.shp"))
+
+
+CensusBikeshare$BSI <- as.numeric(CensusBikeshare$BSI_Dock) ### Convert BSI to just a number(remove units)
+
+
+### Create csv for Census bikeshare data
+BSI_Table <- st_drop_geometry(CensusBikeshare)
+
+write.csv(BSI_Table, here("Data_Output", "BSI_Table.csv"), row.names=FALSE)
+
+
+
+
+
+# Reload data
+BSI_Table <- read_csv(here("Data_Output", "BSI_Table.csv")) 
+
+# WMATA Stations per BG -----
+## Import WMATA station locations
+WMATA_Stations <- read_csv(here("Data", "WMATA_Stations.csv")) #### Can add as many folders needed to find file
+names(WMATA_Stations)
+
+## create a dataset of geometry type POINT
+WMATA_StaLoc <- WMATA_Stations %>%
+  st_as_sf(coords = c("stop_lon", "stop_lat"),
+           crs = 4326) 
+
+### filter for stations accessible to Washington, DC
+WMATA_StaLoc <- WMATA_StaLoc %>%
+  st_filter(CensusData, 
+            .predicate = st_is_within_distance,
+            dist = 1)
+
+### Check WMATA upload and Census data
+mapview(
+  CensusData,
+  zcol = "PpDnsty", ## Variable to display with color
+  layer.name = "Average Population Density"
+) + 
+  mapview(
+    WMATA_StaLoc,
+    col.regions = "red",
+    legend = FALSE
+  )
+
+## Group WMATA stations by BG 
+StationGroup <- st_intersection(x = CensusData, y = WMATA_StaLoc)
+
+StationCount <- StationGroup %>% 
+  group_by(GEOID) %>% 
+  count()
+
+StationCount <- rename(StationCount, WMATA_count = n)
+
+mapview(
+  StationCount,
+  col.regions = "red",
+  legend = FALSE)
+
+## Join WMATA stations to Census data
+CensusBikeshare <- st_join(
+  CensusBikeshare,
+  StationCount,
+  join = st_intersects,
+  suffix = c("_Census", "_WMATA") ### suffix defines the suffixes to be used for columns that share the same names
+) 
+
+names(CensusBikeshare)
+
+### Replace NA with zero
+CensusBikeshare[is.na(CensusBikeshare)] <- 0 #### Replace NAs with 0
+
+## Keep variables of interest
+CensusBikeshare <- CensusBikeshare %>%
+  select(GEOID_Census, 
+         PctBlck, 
+         ZrCrTtl,
+         JbDnsty,
+         PpDnsty, 
+         Un150PP,
+         BSI_Dock,
+         WMATA_count) 
+
+
+CensusBikeshare$BSI <- as.numeric(CensusBikeshare$BSI_Dock) ### Convert BSI to just a number(remove units)
+
+### Create csv for regression data
+CensusRegression <- st_drop_geometry(CensusBikeshare)
+
+write.csv(CensusRegression, here("Data_Output", "CensusRegression.csv"), row.names=FALSE)
+
+
+### Create csv for data
+write.csv(CensusRegression, here("Data_Output", "CensusRegression.csv"), row.names=FALSE)
+
+
+
+
+# Reload data
+CensusRegression <- read_csv(here("Data_Output", "CensusRegression.csv")) 
+
+library(vtable)
+library(pixiedust) 
+library(kableExtra)
+library(stargazer)
+
+## Transform BSI
+
+### BSI Histogram shows log transform might be good 
+hist(CensusRegression$BSI,
+     main= "BSI Histogram",
+     xlab="Bikeshare Index")
+
+
+CensusRegression$Log_BSI <- log(CensusRegression$BSI)
+
+CensusRegression$Log_BSI <- ifelse(is.finite(CensusRegression$Log_BSI), CensusRegression$Log_BSI, 0)
+
+CensusRegression[which(!is.finite(CensusRegression$Log_BSI))] <- 0
+
+
+summary(CensusRegression)
+
+
+
+hist(CensusRegression$Log_BSI,
+     main= "BSI Histogram",
+     xlab="Bikeshare Index")
+
+
+## Create summary statistics
+SummaryData <- CensusRegression %>%
+  select(PctBlck, 
+         ZrCrTtl,
+         JbDnsty,
+         PpDnsty, 
+         Un150PP,
+         BSI,
+         Log_BSI,
+         WMATA_count) 
+
+
+sumtable(SummaryData, 
+         add.median=TRUE,
+         digits = 1,
+         fixed.digits = TRUE)
+
+
+
+
+
+## Correlation matrix 
+
+library(reshape2)
+
+CorMatrix <- round(cor(SummaryData),2)
+head(CorMatrix) #### Returns the first or last parts of a vector, matrix, table, data frame or function
+
+#### Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+  cormat[lower.tri(cormat)]<- NA
+  return(cormat)
+}
+
+upper_tri <- get_upper_tri(CorMatrix) #### Save data for upper triangle
+upper_tri
+
+### Convert an object into a molten data frame.
+melted_Cor <- melt(upper_tri, na.rm=TRUE)
+
+## Heatmap
+ggheatmap <- ggplot(melted_Cor, aes(Var2, Var1, fill = value))+
+  geom_tile(color = "white")+
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab", 
+                       name="Pearson\nCorrelation") +
+  theme_minimal()+ # minimal theme
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                   size = 12, hjust = 1))+
+  coord_fixed()
+
+### Print the heatmap
+print(ggheatmap)
+
+### Add correlation coefficients on the heatmap
+ggheatmap + 
+  geom_text(aes(Var2, Var1, label = value), color = "black", size = 4) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    axis.ticks = element_blank(),
+    legend.justification = c(1, 0),
+    legend.position = c(0.6, 0.7),
+    legend.direction = "horizontal")+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                               title.position = "top", title.hjust = 0.5))
+
+
+
+
+
+## Check variable combinations 
+
+SummaryData %>%
+  ggplot(aes(x=BSI,y=PctBlck)) +
+  geom_point()
+
+SummaryData %>%
+  ggplot(aes(x=BSI,y=ZrCrTtl)) +
+  geom_point()
+
+SummaryData %>%
+  ggplot(aes(x=BSI,y=JbDnsty)) +
+  geom_point()
+
+SummaryData %>%
+  ggplot(aes(x=BSI,y=PpDnsty)) +
+  geom_point()
+
+SummaryData %>%
+  ggplot(aes(x=BSI,y=LogDensity)) +
+  geom_point()
+
+
+
+### The relationship looks like it might not be linear, might be exponential, so try transforming PopDensity
+SummaryData$LogPopDensity <- log(SummaryData$PpDnsty)
+SummaryData$LogJobDensity <- log(SummaryData$JbDnsty)
+
+SummaryData$PopDensity1000 <- (SummaryData$PpDnsty)/1000
+SummaryData$JobDensity1000 <- (SummaryData$JbDnsty)/1000
+
+
+SummaryData %>%
+  ggplot(aes(x=BSI,y=Un150PP)) +
+  geom_point()
+
+SummaryData %>%
+  ggplot(aes(x=BSI,y=WMATA_count)) +
+  geom_point()
+
+
+
+summary(SummaryData)
+
+
+
+# Create linear regression with bikeshare index as dependent variable ----
+
+BSI_Regression <- lm(BSI ~ PctBlck + Un150PP + ZrCrTtl + JobDensity1000 + PopDensity1000 + WMATA_count, data=SummaryData)
+
+summary(BSI_Regression)
+
+stargazer(BSI_Regression, type = "text", out ="RegressionResults.htm")
+
+## Plot Predicted v Actual
+
+SummaryData %>%
+  ggplot(aes(x=predict(BSI_Regression), y=BSI)) +
+  geom_point() + ### Plot type (scatter)
+  geom_abline(intercept=0, slope=1) +
+  labs(title = "Predicted vs. Actual Values",
+       x = "Predicted Values",
+       y = "Actual Values")
+
